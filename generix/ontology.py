@@ -2,6 +2,7 @@ import json
 import os
 import re
 import pandas as pd
+import sys
 from .utils import to_var_name
 from . import services
 
@@ -17,16 +18,17 @@ _TERM_ID_PATTERN = re.compile(r'\w+:\d+')
 
 _TERM_ID = re.compile(r'id:\s+(\w+:\d+)')
 _TERM_NAME = re.compile(r'name:\s+(.+)')
+_TERM_DEF = re.compile(r'def:\s+"(.+)" \[.*?\]')
 _TERM_IS_A = re.compile(r'is_a:\s+(\w+:\d+)')
 _TERM_SYNONYM = re.compile(r'synonym:\s+"(.+)"')
-_TEMR_SCALAR_TYPE = re.compile(r'data_type\s+"(\w+)"')
+_TERM_SCALAR_TYPE = re.compile(r'data_type\s+"(\w+)"')
 _TERM_IS_MICROTYPE = re.compile(r'is_microtype\s+"true"')
 _TERM_IS_DIMENSION = re.compile(r'is_valid_dimension\s+"true"')
 _TERM_IS_DIMENSION_VARIABLE = re.compile(r'is_valid_dimension_variable\s+"true"')
 _TERM_IS_PROPERTY = re.compile(r'is_valid_property\s+"true"')
 _TERM_IS_HIDDEN = re.compile(r'is_hidden\s+"true"')
-_TERM_VALID_UNITES = re.compile(r'valid_units\s+"([\w+:\d+\s*]+)"')
-_TERM_VALID_UNITES_PARENT = re.compile(r'valid_units_parent\s+"([\w+:\d+\s*]+)"')
+_TERM_VALID_UNITS = re.compile(r'valid_units\s+"([\w+:\d+\s*]+)"')
+_TERM_VALID_UNITS_PARENT = re.compile(r'valid_units_parent\s+"([\w+:\d+\s*]+)"')
 _TERM_OREF = re.compile(r'ORef:\s+(\w+:\d+)')
 _TERM_REF = re.compile(r'Ref:\s+(\w+:\d+\.\w+\.\w+)')
 _MICROTYPE_FK_PATTERN = re.compile(r'(\w+:\d+)\.(\w+)\.(\w+)')
@@ -43,9 +45,10 @@ class OntologyService:
             print('Ontology collection is present already')
         
         # build indices
-        print('Ensure ontoloy indices')
+        print('Ensure ontology indices')
         collection = services.arango_service.db[OTERM_COLLECTION_NAME]
-        collection.ensureFulltextIndex(['term_name'],minLength=3)
+        collection.ensureFulltextIndex(['term_name'],minLength=1)
+        collection.ensureFulltextIndex(['term_desc'],minLength=1)
         collection.ensureHashIndex(['term_id'], unique=True)
         collection.ensureHashIndex(['ontology'])
 
@@ -57,6 +60,7 @@ class OntologyService:
             for ont in doc['ontologies']:
                 print('Doing ontology: ' + ont['name'])
                 if 'ignore' in ont and ont['ignore']:
+                    print(' (skipping because of ignore directive)')
                     continue
                 self._upload_ontology(services._IMPORT_DIR_ONTOLOGY, ont)
  
@@ -70,10 +74,15 @@ class OntologyService:
         for _, term in terms.items():
             all_parent_ids = {}
             self._collect_all_parent_ids(term, all_parent_ids)             
+            term_desc = term.term_def;
+            if (len(term.synonyms) > 0):
+                term_desc += '['+', '.join(term.synonyms)+']'
             doc = {
                 'ontology_id': ont_id,
                 'term_id': term.term_id,
                 'term_name': term.term_name,
+                'term_def': term.term_def,
+                'term_desc': term_desc,
                 'term_names': [term.term_name] + term.synonyms,
                 'parent_term_ids': term.parent_ids,
                 
@@ -126,6 +135,7 @@ class OntologyService:
                         # init term properties
                         term_id = None
                         term_name = ''
+                        term_def = ''
                         term_synonyms = []
 
                         term_value_scalar_type = ''
@@ -151,6 +161,10 @@ class OntologyService:
                         m = _TERM_NAME.match(line)
                         if m is not None:
                             term_name = m.groups()[0]
+                    elif line.startswith('def:'):
+                        m = _TERM_DEF.match(line)
+                        if m is not None:
+                            term_def = m.groups()[0]
                     elif line.startswith('is_a:'):
                         m = _TERM_IS_A.match(line)
                         if m is not None:
@@ -186,20 +200,22 @@ class OntologyService:
                             term_is_hidden = True
 
                         else:
-                            m = _TEMR_SCALAR_TYPE.match(pv)
+                            m = _TERM_SCALAR_TYPE.match(pv)
                             if m is not None:
                                 term_value_scalar_type = m.groups()[0]
 
-                            m = _TERM_VALID_UNITES.match(pv)
+                            m = _TERM_VALID_UNITS.match(pv)
                             if m is not None:
                                 term_valid_units = m.groups()[0].split()
                             
-                            m = _TERM_VALID_UNITES_PARENT.match(pv)
+                            m = _TERM_VALID_UNITS_PARENT.match(pv)
                             if m is not None:
                                 term_valid_units_parents = m.groups()[0].split()
 
                     elif line == '':
-                        term = Term(term_id, term_name=term_name,
+                        term = Term(term_id,
+                                    term_name=term_name,
+                                    term_def=term_def,
                                     ontology_id=ont_id,
                                     parent_ids=term_parent_ids,
                                     
@@ -222,7 +238,9 @@ class OntologyService:
                         state = STATE_NONE
 
         if term_id is not None:
-            term = Term(term_id, term_name=term_name,
+            term = Term(term_id,
+                        term_name=term_name,
+                        term_def=term_def,
                         ontology_id=ont_id,
                         parent_ids=term_parent_ids,
                         synonyms=term_synonyms,
@@ -248,7 +266,17 @@ class OntologyService:
         return terms
 
     def _clean_ontology(self, ont_name):
-        pass
+        print("Deleting terms in %s" % ont_name)
+        aql = """
+            FOR x IN @@collection
+            FILTER x.ontology_id==@value
+            REMOVE x in @@collection
+        """
+        aql_bind = {
+            '@collection': OTERM_COLLECTION_NAME,
+            'value': ont_name
+        }
+        self.__arango_service.db.AQLQuery(aql, bindVars=aql_bind)
 
     @property
     def units(self):
@@ -331,7 +359,7 @@ class Ontology:
         #     name = 'ROOT_' + term.property_name
         #     self.__dict__[name] = term
 
-    def __find_terms(self, aql_filter, aql_bind, aql_fulltext=None, size=100):        
+    def __find_terms(self, aql_filter, aql_bind, aql_fulltext=None, size=1000):        
         if aql_filter is None or len(aql_filter) == 0:
             aql_filter = '1==1'
 
@@ -358,7 +386,9 @@ class Ontology:
     def __build_terms(self, aql_result_set):
         terms = []
         for row in aql_result_set:
-            term = Term(row['term_id'], term_name=row['term_name'],
+            term = Term(row['term_id'],
+                        term_name=row['term_name'],
+                        term_def=row['term_def'],
                         ontology_id=row['ontology_id'],
                         parent_ids=row['parent_term_ids'],
                         parent_path_ids=row['parent_path_term_ids'],
@@ -392,7 +422,7 @@ class Ontology:
             terms_hash[term.term_id] = term
         return terms_hash
 
-    def find_root(self, size=100):
+    def find_root(self, size=1000):
         aql_bind = {}
         aql_filter = 'x.parent_term_ids == []'
         return TermCollection(self.__find_terms(aql_filter, aql_bind, size=size))
@@ -400,8 +430,10 @@ class Ontology:
     def find_id(self, term_id):
         aql_bind = {'term_id': term_id}
         aql_filter = 'x.term_id == @term_id'
-        return self.__find_term(aql_filter, aql_bind)        
-
+        try:
+            return self.__find_term(aql_filter, aql_bind)
+        except:
+            raise ValueError('Error finding term id: %s' % term_id)
 
     def find_microtype_dimensions(self, size=1000):    
         aql_bind = {}
@@ -428,7 +460,7 @@ class Ontology:
         aql_filter = 'x.is_microtype == true'
         return MicrotypeCollection(self.__find_terms(aql_filter, aql_bind, size=size))
 
-    def find_ids(self, term_ids, size=100):
+    def find_ids(self, term_ids, size=1000):
         aql_bind = {'term_ids': term_ids}
         aql_filter = 'x.term_id in @term_ids'
 
@@ -439,10 +471,10 @@ class Ontology:
         aql_filter = 'x.term_name == @term_name'
         return self.__find_term(aql_filter, aql_bind)
 
-    def find_name_prefix(self, value, parent_term_id=None, size=100):
+    def find_name_prefix(self, value, parent_term_id=None, size=1000):
         return self.find_name_pattern("prefix:" + value, parent_term_id=parent_term_id, size=size)
 
-    def find_name_pattern(self, value, parent_term_id=None, size=100):
+    def find_name_pattern(self, value, parent_term_id=None, size=1000):
         aql_bind = {
             '@collection': 'OTerm', 
             'property_name': 'term_name', 
@@ -457,13 +489,13 @@ class Ontology:
         return TermCollection(self.__find_terms(aql_filter, aql_bind, 
             aql_fulltext=aql_fulltext, size=size))
 
-    def find_parent_id(self, parent_term_id, size=100):
+    def find_parent_id(self, parent_term_id, size=1000):
         aql_bind = {'parent_term_id': parent_term_id}
         aql_filter = '@parent_term_id in x.parent_term_ids'
 
         return TermCollection(self.__find_terms(aql_filter, aql_bind, size=size))
 
-    def find_parent_path_id(self, parent_term_id, size=100):
+    def find_parent_path_id(self, parent_term_id, size=1000):
         aql_bind = {'parent_term_id': parent_term_id}
         aql_filter = '@parent_term_id in x.parent_path_term_ids'
 
@@ -589,11 +621,12 @@ class TermCollection:
 
 class Term:
     '''
-        Supports lazzy loading
+        Supports lazy loading
     '''
 
     def __init__(self, term_id, 
                 term_name=None, 
+                term_def=None, 
                 ontology_id=None,
                 parent_ids=None, 
                 parent_path_ids=None, 
@@ -616,6 +649,7 @@ class Term:
 
         self.__term_id = term_id
         self.__term_name = term_name
+        self.__term_def = term_def
         self.__ontology_id = ontology_id
         self.__parent_ids = parent_ids
         self.__parent_path_ids = parent_path_ids
@@ -649,6 +683,7 @@ class Term:
 
         #self.__term_id = term_id
         self.__term_name = term.term_name
+        self.__term_def = term.term_def
         self.__ontology_id = term.ontology_id
         self.__parent_ids = term.parent_ids
         self.__parent_path_ids = term.parent_path_ids
@@ -748,15 +783,13 @@ class Term:
 
     def __safe_property(self, prop_name):
         if self.__dict__[prop_name] is None and not self.__persisted:
-            self.__lazzy_load()
+            self.__lazy_load()
         return self.__getattribute__(prop_name)
 
     def refresh(self):
-        self.__lazzy_load()
+        self.__lazy_load()
 
-    def __lazzy_load(self):
-        #TODO: init all properties
-
+    def __lazy_load(self):
         term = services.ontology.all.find_id(self.term_id)
         if term is None:
             raise ValueError('Can not find term with id: %s' % self.term_id)
@@ -784,6 +817,10 @@ class Term:
     @property
     def term_name(self):
         return self.__safe_property('_Term__term_name')
+
+    @property
+    def term_def(self):
+        return self.__safe_property('_Term__term_def')
 
     # @property
     # def property_name(self):
@@ -886,6 +923,7 @@ class Term:
         return {
             'id' : self.term_id,
             'text': self.term_name,
+            'definition': self.term_def,
             'has_units': self.has_units,
             'is_hidden': self.is_hidden,
             'scalar_type': self.microtype_value_scalar_type,
@@ -951,10 +989,10 @@ class Term:
                     self.__parent_terms.append(term)
                 else:
                     raise ValueError('Can not find parent "%s" for term "%s"' % 
-                        (term.term_id, self.term_id))
+                        (pid, self.term_id))
 
 
-class CashedTermProvider:
+class CachedTermProvider:
     def __init__(self):
         self.__id_2_term = {}
 

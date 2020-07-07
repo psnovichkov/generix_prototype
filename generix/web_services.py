@@ -13,8 +13,8 @@ import datetime
 import uuid 
 import os
 import cgi
-
-
+import sys
+import pprint
 
 # from . import services
 # from .brick import Brick
@@ -37,24 +37,75 @@ _PERSONNEL_PARENT_TERM_ID = 'ENIGMA:0000029'
 _CAMPAIGN_PARENT_TERM_ID = 'ENIGMA:0000002'
 _PROCESS_PARENT_TERM_ID = 'PROCESS:0000001'
 
-_UPLOAD_TEMPLAT_PREFIX = 'utp_'
+_UPLOAD_TEMPLATE_PREFIX = 'utp_'
 _UPLOAD_DATA_STRUCTURE_PREFIX = 'uds_'
 _UPLOAD_DATA_FILE_PREFIX = 'udf_'
 _UPLOAD_PROCESSED_DATA_PREFIX = 'udp_'
 _UPLOAD_VALIDATED_DATA_PREFIX = 'uvd_'
+_UPLOAD_VALIDATED_DATA_2_PREFIX = 'uvd2_'
 _UPLOAD_VALIDATION_REPORT_PREFIX = 'uvr_'
 
 
-@app.route("/")
+@app.route("/generix/")
 def hello():
-    return "Welcome!"
+    data_id = 'c74928ccf2e14c87a51a03e7d879eaf5'
+    uds_file_name = os.path.join(TMP_DIR, _UPLOAD_DATA_STRUCTURE_PREFIX + data_id )
+    uvd_file_name = os.path.join(TMP_DIR, _UPLOAD_VALIDATED_DATA_2_PREFIX + data_id )
+    brick_ds = json.loads(open(uds_file_name).read())
+    brick_ds['name'] = 'test4'
+    brick_data = json.loads(open(uvd_file_name).read())
+ 
+    br = _create_brick(brick_ds, brick_data)        
 
-@app.route("/generix/refs_to_core_objects/<data_id>", methods=['GET'])
-def generix_refs_to_core_objects(data_id):
+    process_term = _get_term(brick_ds['process'])
+    person_term = _get_term(brick_ds['personnel'])
+    campaign_term = _get_term(brick_ds['campaign'])
+    input_obj_ids = br.get_fk_refs(process_ufk=True)
+
+    # s = br.to_json()
+    # s = pprint.pformat(json.loads(s))
+    s = pprint.pformat(input_obj_ids)
+    # return s
+    
+    br.save(process_term=process_term,
+            person_term=person_term,
+            campaign_term=campaign_term,
+            input_obj_ids=input_obj_ids)
+
+    return s
+    # return br.id
+    
+    # return ('Welcome!')
+
+@app.route("/generix/refs_to_core_objects/", methods=['POST'])
+def generix_refs_to_core_objects():
     try:
+        brick_ds = json.loads(request.form['brick'])       
+        data_id = brick_ds['data_id']
+
+        # s = pprint.pformat(brick_ds)
+        # sys.stderr.write(s+'\n')
+
         uvd_file_name = os.path.join(TMP_DIR, _UPLOAD_VALIDATED_DATA_PREFIX + data_id )
-        vdata = json.loads(open(uvd_file_name).read())
-        res = vdata['obj_refs']
+        validated_data = json.loads(open(uvd_file_name).read())
+
+        # we need to validate / generate refs to core objects
+        # from properties, because those were not previously mapped
+        for prop in brick_ds['properties']:
+            if prop['require_mapping']:
+                vtype_term_id = prop['type']['id']
+                values = np.array([prop['value']['text']], dtype='object')
+                errors = svs['value_validator'].cast_var_values(values, vtype_term_id, validated_data['obj_refs'])
+
+        # s = pprint.pformat(validated_data)
+        # sys.stderr.write(s+'\n')
+
+        # save to include the newly validated data
+        uvd_file_name = os.path.join(TMP_DIR, _UPLOAD_VALIDATED_DATA_2_PREFIX + data_id )
+        with open(uvd_file_name, 'w') as f:
+            json.dump(validated_data, f, sort_keys=True, indent=4)
+        
+        res = validated_data['obj_refs']
 
         # res = [{
         #     'var_name': 'qqq',
@@ -71,31 +122,65 @@ def generix_refs_to_core_objects(data_id):
 
 @app.route("/generix/search_dimension_microtypes/<value>", methods=['GET'])
 def search_dimension_microtypes(value):
+    if value is None:
+        value = '*'
     return _search_microtypes(svs['ontology'].dimension_microtypes, value)
 
 @app.route("/generix/search_dimension_variable_microtypes/<value>", methods=['GET'])
 def search_dimension_variable_microtypes(value):
+    if value is None:
+        value = '*'
     return _search_microtypes(svs['ontology'].dimension_variable_microtypes, value)
 
 @app.route("/generix/search_data_variable_microtypes/<value>", methods=['GET'])
 def search_data_variable_microtypes(value):
-    # TODO: do we need a special OTerm porperty to select data variable - specific terms
+    # TODO: do we need a special OTerm property to select data variable - specific terms
+    if value is None:
+        value = '*'
     return _search_microtypes(svs['ontology'].dimension_variable_microtypes, value)
-
 
 @app.route("/generix/search_property_microtypes/<value>", methods=['GET'])
 def search_property_microtypes(value):
     return _search_microtypes(svs['ontology'].property_microtypes, value)
 
+def rreplace(s, old, new, occurrence):
+    li = s.rsplit(old, occurrence)
+    return new.join(li)
+
 def _search_microtypes(ontology, value):
     try:
-        if value is None:
-            value = '*'
         res = []
+        if value is None:
+            return _ok_response(res)
 
-        term_collection = ontology.find_name_prefix(value)
+        # look for exact matches first
+        exact_val_pattern = '+'+value.replace(' ',',+')
+        # sys.stderr.write('pattern1 '+exact_val_pattern+'\n')
+        term_collection = ontology.find_name_pattern(exact_val_pattern)
         for term in term_collection.terms:
-            res.append(term.to_descriptor())
+            if not term.is_hidden:
+                td = term.to_descriptor()
+                # sys.stderr.write('exact '+str(td)+'\n')
+                res.append(td)
+
+        # if too many exact matches, don't look for prefix matches
+        if (len(res) > 50):
+            # sys.stderr.write('returning '+str(res)+'\n')
+            return _ok_response(res)
+        
+        # look for prefix matches next, only if value has enough characters
+        if (len(value) > 2):
+            last_prefix_pattern = rreplace(' '+value,' ',',prefix:',1).replace(' ',',+')
+            if last_prefix_pattern.startswith(','):
+                last_prefix_pattern = last_prefix_pattern[1:]
+                # sys.stderr.write('pattern2 '+last_prefix_pattern+'\n')
+                term_collection = ontology.find_name_pattern(last_prefix_pattern)
+                for term in term_collection.terms:
+                    if not term.is_hidden:
+                        td = term.to_descriptor()
+                        # sys.stderr.write('prefix '+str(td)+'\n')
+                        if (td not in res):
+                            res.append(td)
 
         return _ok_response(res)
     except Exception as e:
@@ -115,15 +200,40 @@ def search_property_value_objrefs():
         term = _get_term({ 'id':query['term_id']})
         value = query['value']
         res = []
+        fk = term.microtype_fk
+        if (fk is None):
+            return _err_response('no fk found for '+str(term))
+            
+        # sys.stderr.write('searching for '+str(fk)+'\n')
 
-        res.append({
-            'id' : 0,
-            'text': value + ' - 00'
-        })
-        res.append({
-            'id' : 1,
-            'text': value + ' - 01'
-        })
+        obj_search = re.search('.*\.(.+)\.', fk)
+        if obj_search is None:
+            return _err_response('bad fk pattern '+fk)
+        obj_type = obj_search.group(1)
+        # sys.stderr.write('obj is '+obj_type+'\n')
+
+        upk = svs['typedef'].get_type_def(obj_type).upk_property_def.name
+        itdef = svs['indexdef'].get_type_def(obj_type)
+
+        # sys.stderr.write('collection is '+itdef.collection_name+'\n')
+        # sys.stderr.write('upk is '+upk+'\n')
+        # sys.stderr.write('value is '+value+'\n')
+
+        aql = """
+           FOR x in @@collection
+               FILTER lower(x.@upk) like concat(lower(@value),"%")
+               RETURN {id: x._key, text: x.@upk}
+        """
+        aql_bind = {
+            '@collection' : itdef.collection_name,
+            'upk': upk,
+            'value': value
+        }
+
+        rows = svs['arango_service'].find(aql,aql_bind)
+        for row in rows:
+            res.append(row)
+
         return _ok_response(res)
     except Exception as e:
         return _err_response(e)
@@ -137,11 +247,14 @@ def _search_oterms(ontology, value, parent_term_id=None):
     if parent_term_id == '':
         parent_term_id = None
     term_collection = ontology.find_name_prefix(value, parent_term_id=parent_term_id)
+
     for term in term_collection.terms:
-        res.append({
-            'id' : term.term_id,
-            'text': term.term_name
-        })
+        # sys.stderr.write('id '+term.term_id+' text '+term.term_name+'\n')
+        if not term.is_hidden:
+            res.append({
+                'id' : term.term_id,
+                'text': term.term_name
+            })
     return  json.dumps({
         'results': res
     })
@@ -178,10 +291,11 @@ def _get_oterms(ontology, term_ids=None,  parent_term_ids=None):
     if parent_term_ids is not None:
         for parent_term_id in parent_term_ids:
             for term in ontology.find_parent_path_id(parent_term_id).terms:
-                res[term.term_id] = {
-                    'id' : term.term_id,
-                    'text': term.term_name
-                }
+                if not term.is_hidden:
+                    res[term.term_id] = {
+                        'id' : term.term_id,
+                        'text': term.term_name
+                    }
     res = list(res.values())
     res.sort(key=lambda x: x['text'])
     return  json.dumps({
@@ -334,12 +448,12 @@ def create_brick():
         brick_ds = json.loads(request.form['brick'])       
         data_id = brick_ds['data_id']
 
-        # Save birck data structure (update)
+        # Save brick data structure (update)
         uds_file_name = os.path.join(TMP_DIR, _UPLOAD_DATA_STRUCTURE_PREFIX + data_id )
         with open(uds_file_name, 'w') as f:
             json.dump(brick_ds, f, sort_keys=True, indent=4)
 
-        uvd_file_name = os.path.join(TMP_DIR, _UPLOAD_VALIDATED_DATA_PREFIX + data_id )
+        uvd_file_name = os.path.join(TMP_DIR, _UPLOAD_VALIDATED_DATA_2_PREFIX + data_id )
         brick_data = json.loads(open(uvd_file_name).read())
 
         br = _create_brick(brick_ds, brick_data)        
@@ -457,7 +571,7 @@ def upload_file():
 
         brick_ds = json.loads(request.form['brick'])
 
-        # Save birck data structure
+        # Save brick data structure
         uds_file_name = os.path.join(TMP_DIR, _UPLOAD_DATA_STRUCTURE_PREFIX + data_id )
         with open(uds_file_name, 'w') as f:
             json.dump(brick_ds, f, sort_keys=True, indent=4)
@@ -558,12 +672,15 @@ def _create_brick(brick_ds, brick_data):
         
     brick_type_term = _get_term(brick_ds['type'])
     brick_name = brick_ds['name'] 
+    brick_description = brick_ds['description'] 
 
     bp = dp._get_type_provider('Brick')
-    br = bp.create_brick(type_term=brick_type_term, 
-        dim_terms = dim_type_terms, 
-        shape=dim_sizes,
-        name=brick_name)
+    br = bp.create_brick(type_term = brick_type_term, 
+                         dim_terms = dim_type_terms, 
+                         shape = dim_sizes,
+                         name = brick_name,
+                         description = brick_description
+    )
 
     # add dim variables
     for dim_index, dim in enumerate(brick_dims):
@@ -588,17 +705,21 @@ def _create_brick(brick_ds, brick_data):
         v = br.add_data_var(data_type_term, data_units_term, 
             brick_data['data_vars'][data_var_index]['values'],
             scalar_type=data_type_term.microtype_value_scalar_type)
-        if 'context' in dim_var: 
-            _add_var_context(v, dim_var['context'])
+        if 'context' in data_var: 
+            _add_var_context(v, data_var['context'])
 
 
     # add brick properties
     for prop in brick_properties:
         var_type_term = _get_term(prop['type'])
         var_units_term = _get_term(prop['units'])
-        scalarType = var_type_term.microtype_value_scalar_type
+        scalar_type = var_type_term.microtype_value_scalar_type
         value = prop['value']
-        br.add_attr(var_type_term, var_units_term, scalarType, value)
+        if (scalar_type == 'oterm_ref'):
+            value = value['id']
+        if (scalar_type == 'object_ref'):
+            value = value['text']
+        br.add_attr(var_type_term, var_units_term, scalar_type, value)
 
     return br
 
@@ -610,7 +731,7 @@ def _add_var_context(brick_var, context_elems):
         scalar_type = type_term.microtype_value_scalar_type        
         value = _get_term(ce.get('value')) if  scalar_type == 'oterm_ref' else ce.get('value')['text']
         brick_var.add_attr(type_term=type_term, units_term=units_term, 
-            scalar_type=scalar_type, values=value)
+            scalar_type=scalar_type, value=value)
 
 def _get_term(term_data):
     return svs['term_provider'].get_term( term_data['id'] ) if term_data and term_data['id'] != '' else None
@@ -632,15 +753,16 @@ def login():
     else:
         try:
             payload = {
-		        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=0, seconds=0, microseconds=0, milliseconds=0, minutes=10),
+		        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=0, seconds=0, microseconds=0, milliseconds=0, minutes=120),
 		        'iat': datetime.datetime.utcnow(),
 		        'sub': login['username']
 	        }
             new_jwt = jwt.encode(payload, 'test', algorithm='HS256')
             return json.dumps({'success': True, 'token': new_jwt.decode('utf-8')})
         except Exception as e:
-            return json.dumps({'success': False, 
-            'message': 'Something went wrong'
+            return json.dumps({'success': False,
+                               'message': 'Something went wrong: '
+                               # 'message': 'Something went wrong: '+str(e)
             })  
 
 
@@ -714,21 +836,7 @@ def generix_brick_dimension(brick_id, dim_index):
             'dim_vars':[]
         }
         for dim_var in dim.vars:
-            context = []
-            for attr in dim_var.attrs:
-                context.append({
-                    'type':{
-                        'id': attr.type_term.term_id,
-                        'text': attr.type_term.term_name
-                    },
-                    'units':{
-                        'id': attr.units_term.term_id if attr.units_term else '',
-                        'text': attr.units_term.term_name if attr.units_term else ''
-                    },
-                    'value': str(attr.value)
-                })            
-
-            res['dim_vars'].append({
+            var_data = {
                 'type':{
                     'id': dim_var.type_term.term_id,
                     'text': dim_var.type_term.term_name
@@ -738,8 +846,29 @@ def generix_brick_dimension(brick_id, dim_index):
                     'text': dim_var.units_term.term_name if dim_var.units_term else ''
                 },
                 'values': list([ str(val) for val in dim_var.values][:MAX_ROW_COUNT]),
-                'context': context
-            })
+                'context': []
+            }
+            var_data['type_with_units'] = dim_var.type_term.term_name
+            for attr in dim_var.attrs:
+                var_data['context'].append({
+                    'type':{
+                        'id': attr.type_term.term_id,
+                        'text': attr.type_term.term_name
+                    },
+                    'units':{
+                        'id': attr.units_term.term_id if attr.units_term else '',
+                        'text': attr.units_term.term_name if attr.units_term else ''
+                    },
+                    'value': str(attr.value)
+                })
+                var_data['type_with_units'] += ', '+attr.type_term.term_name+'='+str(attr.value)
+                if attr.units_term:
+                    var_data['type_with_units'] += ', '+attr.units_term.term_name
+            if dim_var.units_term:
+                var_data['type_with_units'] += ' ('+dim_var.units_term.term_name+')'
+
+            res['dim_vars'].append(var_data)
+            
     except Exception as e:
         return _err_response(e)
 
@@ -1156,6 +1285,7 @@ def generix_type_stat():
     for td in type_defs:
         if td.name == 'ENIGMA':
             continue
+        # sys.stderr.write('name '+td.name+'\n')
         stat_type_items.append(
             {
                 'name': td.name,
@@ -1173,7 +1303,14 @@ def generix_type_stat():
     # Dynamic types
     dyn_type_items = []
     rows = arango_service.get_brick_type_counts([],[])
-    for row in rows:
+    # sys.stderr.write('rows: '+str(rows)+'\n')
+    # sys.stderr.write('len: '+str(len(rows))+'\n')
+    # sys.stderr.write('type: '+str(type(rows))+'\n')
+    # Note: awkward code below works around https://github.com/ArangoDB-Community/pyArango/issues/160
+    # can't do 'for row in rows:' because query returns infinite empty lists
+    for i in range(len(rows)):
+        row = rows[i]
+        # sys.stderr.write('row: '+str(row)+'\n')
         dyn_type_items.append(
             {
                 'name': row['b_type'],
@@ -1186,7 +1323,7 @@ def generix_type_stat():
                 }
             }            
         )    
-
+        
     # bp = dp._get_type_provider('Brick')
     # for dt_name in bp.type_names():
 
@@ -1265,7 +1402,10 @@ def _to_process_docs(rows):
     typedef = svs['typedef']
     indexdef = svs['indexdef']
     process_docs = []
-    for row in rows:
+    # Note: awkward code below works around https://github.com/ArangoDB-Community/pyArango/issues/160
+    # can't do 'for row in rows:' because query returns infinite empty lists
+    for i in range(len(rows)):
+        row = rows[i]
         process = row['process']
 
         # build docs
@@ -1303,14 +1443,21 @@ def generix_microtypes():
     try:
         res = []
         for term in svs['ontology'].all.find_microtypes().terms:
+            term_desc = term.term_def;
+            if (len(term.synonyms) > 0):
+                term_desc += ' ['+', '.join(term.synonyms)+']'
             res.append({
                 'term_id': term.term_id,
                 'term_name': term.term_name,
+                'term_def': term.term_def,
+                'term_desc': term_desc,
+                'mt_microtype': term.is_microtype,
                 'mt_dimension': term.is_dimension,
                 'mt_dim_var': term.is_dimension_variable,
                 'mt_data_var': term.is_dimension_variable,
                 'mt_property': term.is_property,
                 'mt_value_scalar_type': term.microtype_value_scalar_type,
+                'mt_parent_term_ids': term.parent_ids,
                 'mt_valid_values': ' valid values',
                 'mt_valid_units': ' valid units'                
             })
@@ -1347,12 +1494,12 @@ def generate_brick_template():
 
         brick_ds = json.loads(request.form['brick'])
 
-        # Save birck data structure
+        # Save brick data structure
         uds_file_name = os.path.join(TMP_DIR, _UPLOAD_DATA_STRUCTURE_PREFIX + data_id )
         with open(uds_file_name, 'w') as f:
             json.dump(brick_ds, f, sort_keys=True, indent=4)
 
-        utp_file_name = os.path.join(TMP_DIR,_UPLOAD_TEMPLAT_PREFIX + data_id)
+        utp_file_name = os.path.join(TMP_DIR,_UPLOAD_TEMPLATE_PREFIX + data_id)
 
         dim_count = len(brick_ds['dimensions'])
         data_var_count = len(brick_ds['dataValues'])

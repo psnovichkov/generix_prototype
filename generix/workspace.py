@@ -1,5 +1,7 @@
 import numpy as np
 import json
+import dumper
+import sys
 from . import services
 from .typedef import TYPE_NAME_PROCESS, TYPE_NAME_BRICK, TYPE_CATEGORY_SYSTEM
 
@@ -158,12 +160,33 @@ class Workspace:
         self._store_process(data_holder)
         self._index_process(data_holder)
 
+    def save_data_if_not_exists(self, data_holder):
+        upk_prop_name = data_holder.type_def.upk_property_def.name
+        upk_id = data_holder.data[upk_prop_name]
+        try:
+            current_pk_id = self._get_pk_id(data_holder.type_name, upk_id)
+        except:
+            current_pk_id = None
+        if current_pk_id is None:
+            self.save_data(data_holder)
+        else:
+            print('skipping %s due to older object' % upk_id)
+            # check for consistency
+            # for now throw an error, although we may want to upsert instead
+            # data_holder_2 = EntityDataHolder(data_holder.type_name,
+            # data_holder.data)
+            # data_holder_2.set_id(current_pk_id)
+            # self._load_object(data_holder_2)
+            # print("new data")
+            # dumper.dump(data_holder)
+            # print("old data")
+            # dumper.dump(data_holder_2)
+
     def save_data(self, data_holder):
         self._generate_id(data_holder)
         self._validate_object(data_holder)
         self._store_object(data_holder)
         self._index_object(data_holder)
-
 
     def _generate_id(self, data_holder):
         id = self.next_id(data_holder.type_name)
@@ -183,7 +206,6 @@ class Workspace:
             if value != value:
                 data_holder.data[key] = None
 
-
     def _store_object(self, data_holder):
         type_name = data_holder.type_name
         pk_id = data_holder.id
@@ -196,7 +218,7 @@ class Workspace:
             # self.__enigma_db.get_collection(
             #     data_holder.type_name).insert_one(data_holder.data)
         elif type(data_holder) is BrickDataHolder:
-            upk_id = data_holder.brick.id
+            upk_id = data_holder.brick.name
             brick_id = data_holder.brick.id
             data_json = data_holder.brick.to_json()
             data = json.loads(data_json)
@@ -207,6 +229,26 @@ class Workspace:
 
         self._store_object_type_ids(type_name, pk_id, upk_id)
 
+    def _load_object(self, data_holder):
+        pk_id = data_holder.id
+        aql = 'RETURN DOCUMENT(@@collection/@pk_id)'
+        aql_bind = {
+            '@collection': TYPE_CATEGORY_SYSTEM + _COLLECTION_OBJECT_TYPE_ID,
+            'pk_id': pk_id
+        }
+        res = self.__arango_service.find(aql,aql_bind)
+        type2objects = {}
+        for row in res:
+            _id = row['_id']
+            type_name = _id.split('/')[0][4:]
+        
+            objs = type2objects.get(type_name)
+            if objs is None:
+                objs = []
+                type2objects[type_name] = objs
+            objs.append(row)
+        # dumper.dump(type2objects)
+
     def _get_pk_id(self, type_name, upk_id):
 
         aql = 'FOR x IN @@collection FILTER x.type_name == @type_name and x.upk_id == @upk_id return x'
@@ -215,6 +257,7 @@ class Workspace:
             'type_name': type_name,
             'upk_id': upk_id
         }
+        # print(str(aql_bind))
 
         res = self.__arango_service.find(aql,aql_bind)
         if len(res) == 0:
@@ -257,11 +300,13 @@ class Workspace:
 
         process = data_holder.data
         process_db_id = '%s/%s' % (data_holder.type_def.collection_name, data_holder.id) 
-
+        # sys.stderr.write('process_dbid = '+str(process_db_id)+'\n')
+        
         # Do input objects
         for input_object in process['input_objects']:
             type_name, obj_id = input_object.split(':')
             type_def = services.indexdef.get_type_def(type_name)
+            # sys.stderr.write('from = '+str(type_def.collection_name+':'+type_name+'/'+obj_id)+'\n')
 
             self.__arango_service.index_doc(
                 {
@@ -270,10 +315,11 @@ class Workspace:
                 }, 'ProcessInput', TYPE_CATEGORY_SYSTEM
             )      
 
-        # Do ouput objects
+        # Do output objects
         for output_object in process['output_objects']:
             type_name, obj_id = output_object.split(':')
             type_def = services.indexdef.get_type_def(type_name)
+            # sys.stderr.write('to = '+str(type_def.collection_name+':'+type_name+'/'+obj_id)+'\n')
 
             self.__arango_service.index_doc(
                 {

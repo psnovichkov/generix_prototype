@@ -4,6 +4,7 @@ import pandas as pd
 import xarray as xr
 import re
 import datetime
+import sys
 from time import gmtime, strftime
 from .ontology import Term
 from .workspace import BrickDataHolder, ProcessDataHolder
@@ -39,7 +40,7 @@ def _collect_all_term_values(term_id_2_values, term_id, data_values):
 DATA_EXAMPLE_SIZE = 5
     
 class PropertyValue:
-    def __init__(self, name=None, type_term=None, units_term=None, scalar_type='str', value=None):
+    def __init__(self, name=None, type_term=None, units_term=None, scalar_type='string', value=None):
         if type_term is None:
             raise ValueError('type_term can not be None')
         if type(type_term) is not Term:
@@ -53,7 +54,7 @@ class PropertyValue:
 
         #TODO validate scalar_type and the value
         self.scalar_type = scalar_type
-        
+
         self.value = value
         self.name = name if name is not None else type_term.term_name   
 
@@ -62,19 +63,24 @@ class PropertyValue:
         term = json_data['value_type']
         type_term = services.term_provider.get_term(term['oterm_ref'])
         # type_term = Term(term['oterm_ref'], term_name=term['oterm_name'])
-
+            
         value_type = json_data['value']['scalar_type']
 
         if value_type == 'oterm_ref':
             # value = Term(json_data['value'][value_type])
             value = services.term_provider.get_term(json_data['value'][value_type])
-
+        elif value_type == 'object_ref':
+            value = json_data['value']['object_ref']
         else:
-            value = json_data['value'][value_type + '_value']     
-            
-        # TODO: units    
-        return PropertyValue( type_term=type_term, scalar_type=value_type, value=value )
+            value = json_data['value'][value_type + '_value']
 
+        if 'value_units' in json_data:
+            term = json_data['value_units']
+            units_term = services.term_provider.get_term(term['oterm_ref'])
+        else:
+            units_term = None
+
+        return PropertyValue( type_term=type_term, units_term=units_term, scalar_type=value_type, value=value )
 
 
 
@@ -128,14 +134,15 @@ class Brick:
         # ds.attrs['__attr2'] = PropertyValue( type_term=Term('AA:145', 'Genome'), value='E.coli'  )
 
         ds.attrs['__attr_count'] = 0
-        for prop_data in json_data['array_context']:
-            try:
-                pv = PropertyValue.read_json(prop_data)        
-                ds.attrs['__attr_count'] += 1
-                attr_name = '__attr%s' % ds.attrs['__attr_count'] 
-                ds.attrs[attr_name] = pv
-            except Exception as e:
-                print('Error: can not read property', e, prop_data)
+        if 'array_context' in json_data:
+            for prop_data in json_data['array_context']:
+                try:
+                    pv = PropertyValue.read_json(prop_data)        
+                    ds.attrs['__attr_count'] += 1
+                    attr_name = '__attr%s' % ds.attrs['__attr_count'] 
+                    ds.attrs[attr_name] = pv
+                except Exception as e:
+                    print('Error: can not read property', e, prop_data)
         
         # do dimensions
         # ds.attrs['__dim_count'] = dim_count    
@@ -186,7 +193,12 @@ class Brick:
                     var_values = []
                     for term_id in var_json['values']['oterm_refs']:
                         # var_values.append(Term(term_id))
-                        var_values.append(services.term_provider.get_term(term_id))                        
+                        if term_id is None:
+                            var_values.append(None)
+                        else:
+                            var_values.append(services.term_provider.get_term(term_id))
+                elif var_scalar_type == 'object_ref':
+                    var_values = var_json['values']['object_refs']
                 else:
                     var_values = var_json['values'][var_scalar_type + '_values']
 
@@ -245,10 +257,12 @@ class Brick:
 
             value_scalar_type = values_json['values']['scalar_type']
             if value_scalar_type == 'oterm_ref':
-                value_scalar_type = 'oterm_refs'
+                value_scalar_key = 'oterm_refs'
+            elif value_scalar_type == 'object_ref':
+                value_scalar_key = 'object_refs'
             else:
-                value_scalar_type += '_values'
-            data = np.array(values_json['values'][value_scalar_type])
+                value_scalar_key = value_scalar_type+'_values'
+            data = np.array(values_json['values'][value_scalar_key])
             data = data.reshape(dim_sizes)    
             
             # da = xr.DataArray(np.random.rand(dim1_size, dim2_size, dim3_size), dims=(dim1,dim2, dim3))
@@ -565,10 +579,11 @@ class Brick:
                     for fk_id in fk_ids:
                         fk_refs.add('%s:%s' % (core_type, fk_id))
 
-        # TODO: needs to make a decision whether 
+        # TODO: need to make a decision whether 
         #  to collect fk_ids from data_vars
 
-        return fk_refs
+        # must return list, not set
+        return sorted(fk_refs)
 
     def _convert_ufk_to_fk(self, core_type, ufk_values):
         index_type_def = services.indexdef.get_type_def(core_type)        
@@ -585,7 +600,7 @@ class Brick:
     def to_json(self, exclude_data_values=False, typed_values_property_name=True):
         return json.dumps(
             self.to_dict(exclude_data_values=exclude_data_values,
-                typed_values_property_name=typed_values_property_name ), 
+                typed_values_property_name=typed_values_property_name ),
             cls=NPEncoder)
 
     def to_dict(self, exclude_data_values=False, typed_values_property_name=True):
@@ -625,22 +640,31 @@ class Brick:
         # return PropertyValue( type_term=type_term, scalar_type=value_type, value=value )
 
 
-        # TODO: units
         data['array_context'] = []
         for attr in self.attrs:
             value_key = ''
             value_val = ''
             if attr.value is not None and type(attr.value) is Term:
                 value_key = attr.scalar_type
-                value_val = attr.value.term_id
+                if typed_values_property_name:
+                    value_val = attr.value.term_id
+                else:
+                    value_val = attr.value.term_name
             else:
-                value_key = attr.scalar_type + '_value'
+                if (attr.scalar_type == 'object_ref'):
+                    value_key = 'object_ref'
+                elif (attr.scalar_type == 'oterm_ref'):
+                    value_key = 'oterm_ref'
+                else:
+                    value_key = attr.scalar_type + '_value'
                 value_val = attr.value
 
             if not typed_values_property_name:
                 value_key = 'value'
 
-            data['array_context'].append({
+            # sys.stderr.write('type = '+str(attr.type_term)+'\n')
+
+            context = {
                 'value_type':{
                     'oterm_ref': attr.type_term.term_id,
                     'oterm_name': attr.type_term.term_name
@@ -649,8 +673,19 @@ class Brick:
                     'scalar_type': attr.scalar_type,
                     value_key : value_val
                 }
-            })
+            }
 
+            if attr.units_term is not None:
+                # sys.stderr.write('units = '+str(attr.units_term)+'\n')
+                context['value_units'] = {
+                    'oterm_ref': attr.units_term.term_id,
+                    'oterm_name': attr.units_term.term_name
+                }
+                if not typed_values_property_name:
+                    context['value_with_units'] = str(value_val)+' ('+attr.units_term.term_name+')'
+                
+
+            data['array_context'].append(context)
 
         # do dimensions
         data['dim_context'] = []
@@ -702,16 +737,22 @@ class Brick:
                 # Do type and values
                 value_key = ''
                 value_vals = []
+
                 if var.scalar_type == 'oterm_ref':
                     value_key = 'oterm_refs'
-                    value_vals = [t.term_id for t in var.values]
+                    if typed_values_property_name:
+                        value_vals = [None if t is None else t.term_id for t in var.values]
+                    else:
+                        value_vals = [None if t is None else t.term_name for t in var.values]
+                elif var.scalar_type == 'object_ref':
+                    value_key = 'object_refs'
+                    value_vals = list(var.values)
                 else:
                     value_key = var.scalar_type + '_values'
                     value_vals = list(var.values)
 
                 if not typed_values_property_name:
                     value_key = 'values'
-
 
                 var_data = {
                     'value_type': {
@@ -725,12 +766,9 @@ class Brick:
                     'value_context': []
                 }
 
-                # Do units
-                if var.units_term is not None:
-                    var_data['value_units'] = {
-                        'oterm_ref': var.units_term.term_id,
-                        'oterm_name': var.units_term.term_name
-                    }
+                if not typed_values_property_name:
+                    var_data['value_with_units'] = var.type_term.term_name
+                    var_data['value_no_units'] = var.type_term.term_name
 
                 # Do attributes
                 for attr in var.attrs:
@@ -738,7 +776,10 @@ class Brick:
                     value_val = ''
                     if attr.value is not None and type(attr.value) is Term:
                         value_key = attr.scalar_type
-                        value_val = attr.value.term_id
+                        if typed_values_property_name:
+                            value_val = attr.value.term_id
+                        else:
+                            value_val = attr.value.term_name
                     else:
                         value_key = attr.scalar_type + '_value'
                         value_val = attr.value
@@ -756,6 +797,21 @@ class Brick:
                             value_key : value_val
                         }
                     })
+
+                    if not typed_values_property_name:
+                        var_data['value_with_units'] += ', '+attr.type_term.term_name+'='+value_val
+                        var_data['value_no_units'] += ', '+attr.type_term.term_name+'='+value_val
+                    
+                    
+                # Do units
+                if var.units_term is not None:
+                    var_data['value_units'] = {
+                        'oterm_ref': var.units_term.term_id,
+                        'oterm_name': var.units_term.term_name
+                    }
+                    if not typed_values_property_name:
+                        var_data['value_with_units'] += ' ('+var.units_term.term_name+')'
+
                 dim_data['typed_values'].append(var_data)
             
         # do data
@@ -765,7 +821,13 @@ class Brick:
             value_vals = []
             if vard.scalar_type == 'oterm_ref':
                 value_key = 'oterm_refs'
-                value_vals = [t.term_id for t in vard.values]
+                if typed_values_property_name:
+                    value_vals = [t.term_id for t in vard.values]
+                else:
+                    value_vals = [t.term_name for t in vard.values]
+            elif vard.scalar_type == 'object_ref':
+                value_key = 'object_refs'
+                value_vals = list(vard.values)
             else:
                 value_key = vard.scalar_type + '_values'
                 value_vals = list(vard.values)
@@ -786,12 +848,9 @@ class Brick:
                     value_key: value_vals
                 }
 
-            # Do units
-            if vard.units_term is not None:
-                values_data['value_units'] = {
-                    'oterm_ref': vard.units_term.term_id,
-                    'oterm_name': vard.units_term.term_name
-                }
+            if not typed_values_property_name:
+                values_data['value_with_units'] = vard.type_term.term_name
+                values_data['value_no_units'] = vard.type_term.term_name
 
             # Do attributes
             for attr in vard.attrs:
@@ -799,7 +858,10 @@ class Brick:
                 value_val = ''
                 if attr.value is not None and type(attr.value) is Term:
                     value_key = attr.scalar_type
-                    value_val = attr.value.term_id
+                    if typed_values_property_name:
+                        value_val = attr.value.term_id
+                    else:
+                        value_val = attr.value.term_name
                 else:
                     value_key = attr.scalar_type + '_value'
                     value_val = attr.value
@@ -817,6 +879,19 @@ class Brick:
                         value_key : value_val
                     }
                 })
+
+                if not typed_values_property_name:
+                    values_data['value_with_units'] += ', '+attr.type_term.term_name+'='+value_val
+                    values_data['value_no_units'] += ', '+attr.type_term.term_name+'='+value_val
+                
+            # Do units
+            if vard.units_term is not None:
+                values_data['value_units'] = {
+                    'oterm_ref': vard.units_term.term_id,
+                    'oterm_name': vard.units_term.term_name
+                }
+                if not typed_values_property_name:
+                    values_data['value_with_units'] += ' ('+vard.units_term.term_name+')'
 
             data['typed_values'].append(values_data)
         return data
@@ -965,7 +1040,7 @@ class Brick:
             if attr_name == '__dim_count':
                 xds.attrs[attr_name] = self.dim_count - 1
             elif attr_name.startswith('__dim'):
-                # skip the dim data with dim_index amd decrese dim indexes
+                # skip the dim data with dim_index amd decrease dim indexes
                 attr_name_vals = attr_name[len('__dim'):].split('_')
                 di = int(attr_name_vals[0])
                 # print( 'attr_name', attr_name)
@@ -1395,7 +1470,7 @@ class BrickVariable:
                 val  = attr.value
                 if type(val) is Term:
                     val = val.term_name
-                items.append(val)
+                items.append(str(val))
 
         return to_var_name('',' '.join(items))
 
